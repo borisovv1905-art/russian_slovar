@@ -24,6 +24,14 @@ def test_real_file_loads_without_errors():
     assert all(w["слово"] and w["значение"] for w in words)
 
 
+def test_images_from_words_file_exist():
+    words, _ = load_words(ROOT / "words.yaml")
+    for w in words:
+        path = w["картинка"]
+        if path and not path.startswith(("http://", "https://")):
+            assert (ROOT / path).is_file(), f"Нет файла картинки: {path} (слово «{w['слово']}»)"
+
+
 def test_norm_treats_yo_as_ye():
     assert norm("  ЁЖ ") == "еж"
 
