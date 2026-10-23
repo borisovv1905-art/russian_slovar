@@ -27,6 +27,11 @@ def norm(text) -> str:
     return str(text).lower().replace("ё", "е").strip()
 
 
+def capitalize_first(text: str) -> str:
+    """Делает заглавной только первую букву, остальное не трогает («ёлка-палка» → «Ёлка-палка»)."""
+    return text[:1].upper() + text[1:]
+
+
 def load_words(path) -> tuple[list[dict], list[str]]:
     """Читает words.yaml. Возвращает (слова, список понятных ошибок)."""
     errors: list[str] = []

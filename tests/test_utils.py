@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from utils import filter_words, load_words, norm, sort_words, unique_values, word_of_day  # noqa: E402
+from utils import capitalize_first, filter_words, load_words, norm, sort_words, unique_values, word_of_day  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -26,6 +26,13 @@ def test_real_file_loads_without_errors():
 
 def test_norm_treats_yo_as_ye():
     assert norm("  ЁЖ ") == "еж"
+
+
+def test_capitalize_first_changes_only_first_letter():
+    assert capitalize_first("жеребий") == "Жеребий"
+    assert capitalize_first("ёлка-Палка") == "Ёлка-Палка"
+    assert capitalize_first("Кибитка") == "Кибитка"
+    assert capitalize_first("") == ""
 
 
 def test_missing_required_fields_reported():

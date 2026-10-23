@@ -4,7 +4,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from utils import filter_words, load_words, sort_words, unique_values, word_of_day
+from utils import capitalize_first, filter_words, load_words, sort_words, unique_values, word_of_day
 
 BASE = Path(__file__).resolve().parent
 WORDS_FILE = BASE / "words.yaml"
@@ -54,7 +54,7 @@ def show_word(word: dict):
         with left:
             show_image(word)
         with right:
-            title = f"### {word['слово']}"
+            title = f"### {capitalize_first(word['слово'])}"
             if word["пометка"]:
                 title += f" &nbsp; :gray[{word['пометка']}]"
             st.markdown(title)
