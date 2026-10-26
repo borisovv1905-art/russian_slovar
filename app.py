@@ -1,6 +1,7 @@
 """Словарь прочитанного: личный словарь незнакомых и старых слов из книг."""
 from __future__ import annotations
 
+import random
 from html import escape
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import streamlit as st
 
 import lookup
 import store
+import train
 from utils import capitalize_first, filter_words, load_words, norm, sort_words, unique_values, word_of_day
 
 BASE = Path(__file__).resolve().parent
@@ -51,7 +53,7 @@ def show_image(word: dict, uploaded: bytes | None = None):
         st.caption(word["картинка_источник"])
 
 
-def show_word(word: dict, uploaded: bytes | None = None):
+def show_word(word: dict, uploaded: bytes | None = None, learned: bool = False):
     """Карточка слова: слева картинка, справа текст."""
     with st.container(border=True):
         left, right = st.columns([1, 2])
@@ -61,6 +63,8 @@ def show_word(word: dict, uploaded: bytes | None = None):
             title = f"### {capitalize_first(word['слово'])}"
             if word["пометка"]:
                 title += f" &nbsp; :gray[{word['пометка']}]"
+            if learned:
+                title += " &nbsp; :green[✅ выучено]"
             st.markdown(title)
             st.write(word["значение"])
             if word["цитата"]:
@@ -308,6 +312,191 @@ def edit_tab(words: list[dict]):
                 st.rerun()
 
 
+# ---------- тренировка ----------
+def ensure_progress() -> dict:
+    """Прогресс тренировки: один раз за сеанс читается с GitHub (ветка progress), дальше живёт в сеансе."""
+    if "progress" not in st.session_state:
+        try:
+            st.session_state["progress"] = store.load_progress(get_repo().with_branch(store.PROGRESS_BRANCH))
+        except Exception:  # noqa: BLE001  нет сети или токен не подошёл: начинаем с пустого, при сохранении всё сольётся
+            st.session_state["progress"] = {}
+            st.warning("Не удалось прочитать сохранённый прогресс. Тренироваться можно, а при сохранении он объединится с тем, что лежит на GitHub.")
+        st.session_state["progress_dirty"] = False
+    return st.session_state["progress"]
+
+
+def flush_progress() -> bool:
+    """Сохраняет прогресс на GitHub (в отдельную ветку, приложение от этого не перезапускается)."""
+    try:
+        with st.spinner("Сохраняю прогресс…"):
+            merged = store.save_progress(store.progress_repo(get_repo()), st.session_state["progress"])
+        st.session_state["progress"] = merged
+        st.session_state["progress_dirty"] = False
+        return True
+    except store.StoreError as exc:
+        st.error(str(exc))
+    except Exception:  # noqa: BLE001
+        st.error("Не получилось связаться с GitHub, прогресс пока не сохранён. Попробуй ещё раз.")
+    return False
+
+
+def answer(round_: dict, word: dict, correct: bool):
+    rec = train.record_answer(st.session_state["progress"], word, correct)
+    st.session_state["progress_dirty"] = True
+    round_["log"].append((word["слово"], correct))
+    round_["just_learned"] = bool(correct and rec.get("выучено") and rec["серия"] == train.LEARNED_STREAK)
+
+
+def front_side(word: dict, direction: str):
+    """Лицевая сторона вопроса."""
+    if direction == train.DIRECTIONS[0]:
+        st.markdown(f"## {capitalize_first(word['слово'])}")
+        if word["цитата"]:
+            st.markdown(f"> «{train.mark_quote(word['слово'], word['цитата'])}»")
+    else:
+        st.markdown(f"#### {capitalize_first(word['значение'])}")
+        blank = train.blank_quote(word["слово"], word["цитата"]) if word["цитата"] else None
+        if blank:
+            st.markdown(f"> «{blank}»")
+
+
+def next_button(round_: dict, word: dict):
+    left, right = st.columns(2)
+    with left:
+        if st.button("Дальше →", key=f"next_{round_['pos']}", type="primary"):
+            round_["pos"] += 1
+            round_["revealed"], round_["picked"] = False, None
+            st.rerun()
+    with right:
+        if st.button("🎓 Выучено, больше не показывать", key=f"learn_{round_['pos']}"):
+            train.set_learned(st.session_state["progress"], word, True)
+            st.session_state["progress_dirty"] = True
+            round_["pos"] += 1
+            round_["revealed"], round_["picked"] = False, None
+            st.rerun()
+
+
+def play_round(round_: dict, words: list[dict]):
+    total = len(round_["words"])
+    if round_["pos"] >= total:
+        right = sum(1 for _, ok in round_["log"] if ok)
+        st.success(f"Раунд окончен: верно {right} из {total}.")
+        wrong = [w for w, ok in round_["log"] if not ok]
+        if wrong:
+            st.write("Стоит повторить: " + ", ".join(capitalize_first(w) for w in wrong))
+        if not round_.get("saved") and st.session_state.get("progress_dirty"):
+            round_["saved"] = flush_progress()
+        if round_.get("saved"):
+            st.caption("Прогресс сохранён.")
+        if st.button("Ещё раунд", type="primary"):
+            st.session_state["train"] = None
+            st.rerun()
+        return
+
+    pos = round_["pos"]
+    word = round_["words"][pos]
+    st.progress(pos / total, text=f"Слово {pos + 1} из {total}")
+    with st.container(border=True):
+        front_side(word, round_["direction"])
+
+    if round_["mode"] == "Карточки":
+        if not round_["revealed"]:
+            if st.button("Показать ответ", key=f"show_{pos}", type="primary"):
+                round_["revealed"] = True
+                st.rerun()
+            return
+        show_word(word)
+        left, right = st.columns(2)
+        with left:
+            if st.button("✅ Знал", key=f"yes_{pos}", type="primary"):
+                answer(round_, word, True)
+                round_["pos"] += 1
+                round_["revealed"] = False
+                st.rerun()
+        with right:
+            if st.button("❌ Не знал", key=f"no_{pos}"):
+                answer(round_, word, False)
+                round_["pos"] += 1
+                round_["revealed"] = False
+                st.rerun()
+        return
+
+    # викторина
+    quiz = round_["quiz"][pos]
+    if round_["picked"] is None:
+        for i, option in enumerate(quiz["варианты"]):
+            if st.button(option, key=f"opt_{pos}_{i}", use_container_width=True):
+                round_["picked"] = i
+                answer(round_, word, i == quiz["верный"])
+                st.rerun()
+        return
+    ok = round_["picked"] == quiz["верный"]
+    (st.success if ok else st.error)("Верно!" if ok else f"Не совсем. Правильный ответ: {quiz['варианты'][quiz['верный']]}")
+    if round_.get("just_learned"):
+        st.info("🎓 Три верных подряд: слово теперь считается выученным.")
+    show_word(word)
+    next_button(round_, word)
+
+
+def train_tab(words: list[dict]):
+    """Вкладка «Тренировка»: карточки и викторина с прогрессом."""
+    if not login_ok("train"):
+        return
+    progress = ensure_progress()
+    stats = train.stats(words, progress)
+    if stats["всего"]:
+        st.progress(stats["выучено"] / stats["всего"],
+                    text=f"Выучено {stats['выучено']} из {stats['всего']} · в работе {stats['в работе']} · новых {stats['новых']}")
+    if st.session_state.get("progress_dirty") and st.session_state.get("train") is None:
+        st.warning("Есть несохранённый прогресс.")
+        if st.button("Сохранить прогресс"):
+            if flush_progress():
+                st.rerun()
+
+    round_ = st.session_state.get("train")
+    if round_ is None:
+        if len(words) < 1:
+            st.info("В словаре пока нет слов для тренировки.")
+            return
+        mode = st.radio("Режим", ["Карточки", "Викторина"], horizontal=True, key="tr_mode")
+        direction = st.radio("Что показывать", list(train.DIRECTIONS), horizontal=True, key="tr_dir")
+        count = st.selectbox("Сколько слов в раунде", [5, 10, 15, 20], index=1, key="tr_count")
+        review = st.checkbox("Включить выученные (повторение)", key="tr_review")
+        quiz_blocked = mode == "Викторина" and len(words) < 2
+        if quiz_blocked:
+            st.info("Для викторины нужно хотя бы два слова.")
+        if st.button("Начать", type="primary", disabled=quiz_blocked):
+            rng = random.Random()
+            picked = train.pick_words(words, progress, count, rng, include_learned=review)
+            if not picked:
+                st.info("Все слова выучены 🎉 Включи «повторение», чтобы пройтись по ним ещё раз.")
+            else:
+                quiz = train.make_quiz(words, picked, direction, rng) if mode == "Викторина" else None
+                if quiz is not None:
+                    picked = [q["слово"] for q in quiz]
+                st.session_state["train"] = {"mode": mode, "direction": direction, "words": picked, "quiz": quiz,
+                                             "pos": 0, "revealed": False, "picked": None, "log": []}
+                st.rerun()
+    else:
+        play_round(round_, words)
+        if round_["pos"] < len(round_["words"]) and st.button("Закончить раунд", key="stop_round"):
+            if st.session_state.get("progress_dirty"):
+                flush_progress()
+            st.session_state["train"] = None
+            st.rerun()
+
+    learned = [w for w in words if train.is_learned(progress, w)]
+    if learned:
+        with st.expander(f"Выученные слова ({len(learned)})"):
+            for w in sort_words(learned, "az"):
+                c1, c2 = st.columns([3, 1])
+                c1.write(capitalize_first(w["слово"]))
+                if c2.button("Вернуть в изучение", key=f"unlearn_{train.key_of(w)}"):
+                    train.set_learned(progress, w, False)
+                    st.session_state["progress_dirty"] = True
+                    st.rerun()
+
+
 # ---------- данные ----------
 words, problems = get_words(WORDS_FILE.stat().st_mtime if WORDS_FILE.exists() else 0.0)
 
@@ -316,13 +505,19 @@ st.caption(f"Слов в словаре: {len(words)}")
 for problem in problems:
     st.warning(problem)
 
-tab_dict, tab_add, tab_edit = st.tabs(["📖 Словарь", "➕ Добавить слово", "✏️ Править / удалить"])
+tab_dict, tab_add, tab_edit, tab_train = st.tabs(["📖 Словарь", "➕ Добавить слово", "✏️ Править / удалить", "🎯 Тренировка"])
 
 with tab_add:
     add_tab(words)
 
 with tab_edit:
     edit_tab(words)
+
+with tab_train:
+    train_tab(words)
+
+# прогресс известен только после входа; без него словарь просто не показывает отметки «выучено»
+progress = st.session_state.get("progress") if st.session_state.get("add_ok") else None
 
 with tab_dict:
     if not words:
@@ -335,6 +530,7 @@ with tab_dict:
             work = st.selectbox("Произведение", ["Все"] + unique_values(words, "произведение"))
             label = st.selectbox("Пометка", ["Все"] + unique_values(words, "пометка"))
             order = st.radio("Порядок", ["По алфавиту", "Сначала новые"])
+            hide_learned = st.checkbox("Скрыть выученные") if progress is not None else False
 
         # ---------- слово дня ----------
         if not query and work == "Все" and label == "Все":
@@ -352,9 +548,11 @@ with tab_dict:
             label="" if label == "Все" else label,
         )
         found = sort_words(found, "new" if order == "Сначала новые" else "az")
+        if hide_learned:
+            found = [w for w in found if not train.is_learned(progress, w)]
 
         st.subheader(f"Найдено: {len(found)}")
         if not found:
             st.info("Ничего не нашлось. Попробуй изменить запрос или сбросить фильтры.")
         for item in found:
-            show_word(item)
+            show_word(item, learned=progress is not None and train.is_learned(progress, item))

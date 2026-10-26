@@ -9,7 +9,7 @@ import html
 import re
 from urllib.parse import quote as urlquote
 
-from utils import norm
+from utils import norm, word_stem
 
 UA = {"User-Agent": "slovar-prochitannogo/1.0 (personal reading dictionary; https://github.com/borisovv1905-art/russian_slovar)"}
 WIKT_API = "https://ru.wiktionary.org/w/api.php"
@@ -151,9 +151,7 @@ def quote_has_word(word: str, quote: str) -> bool:
     for part in re.split(r"[\s-]+", norm(word)):
         if not part:
             continue
-        n = len(part)
-        stem = part if n <= 3 else part[:-1] if n <= 5 else part[:-2] if n <= 7 else part[:-3]
-        if stem not in q:
+        if word_stem(part) not in q:
             return False
     return True
 

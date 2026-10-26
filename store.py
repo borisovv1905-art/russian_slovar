@@ -201,6 +201,27 @@ class GitHubRepo:
             raise ConflictError()
         self._fail(resp, f"запись {path}")
 
+    def with_branch(self, branch: str) -> "GitHubRepo":
+        """Тот же репозиторий и токен, другая ветка."""
+        return GitHubRepo(self.repo, self._token, branch, http=self.http)
+
+    def ensure_branch(self, name: str) -> None:
+        """Создаёт ветку name от основной, если её ещё нет."""
+        resp = self.http.get(f"{API}/repos/{self.repo}/git/ref/heads/{name}", headers=self._headers(), timeout=20)
+        if resp.status_code == 200:
+            return
+        if resp.status_code != 404:
+            self._fail(resp, f"проверка ветки {name}")
+        base = self.http.get(f"{API}/repos/{self.repo}/git/ref/heads/{self.branch}", headers=self._headers(), timeout=20)
+        if base.status_code != 200:
+            self._fail(base, f"чтение ветки {self.branch}")
+        created = self.http.post(
+            f"{API}/repos/{self.repo}/git/refs", headers=self._headers(),
+            json={"ref": f"refs/heads/{name}", "sha": base.json()["object"]["sha"]}, timeout=20,
+        )
+        if created.status_code not in (200, 201, 422):   # 422 — ветку уже успели создать
+            self._fail(created, f"создание ветки {name}")
+
     def delete_file(self, path: str, message: str, sha: str) -> None:
         body = {"message": message, "sha": sha, "branch": self.branch}
         resp = self.http.request(
@@ -378,3 +399,40 @@ def delete_word(repo, word: str, delete_image: bool = True) -> dict:
     if delete_image and _deletable_image(old["картинка"]) and _image_unused(new_text, old["картинка"]):
         _drop_image(repo, old["картинка"], word)
     return old
+
+
+# ---------- прогресс тренировки ----------
+# Хранится в progress.json на отдельной ветке «progress»: коммиты туда не перезапускают приложение.
+
+PROGRESS_PATH = "progress.json"
+PROGRESS_BRANCH = "progress"
+
+
+def progress_repo(repo: GitHubRepo) -> GitHubRepo:
+    """Репозиторий, настроенный на ветку прогресса (ветка создаётся при первом обращении)."""
+    repo.ensure_branch(PROGRESS_BRANCH)
+    return repo.with_branch(PROGRESS_BRANCH)
+
+
+def load_progress(prog_repo) -> dict:
+    import train
+
+    current = prog_repo.get_file(PROGRESS_PATH)
+    return train.load_progress_text(current[0].decode("utf-8")) if current else {}
+
+
+def save_progress(prog_repo, progress: dict, attempts: int = 3) -> dict:
+    """Сливает прогресс с тем, что уже лежит на GitHub (например, с другого устройства), и сохраняет."""
+    import train
+
+    for _ in range(attempts):
+        current = prog_repo.get_file(PROGRESS_PATH)
+        remote = train.load_progress_text(current[0].decode("utf-8")) if current else {}
+        merged = train.merge_progress(progress, remote)
+        try:
+            prog_repo.put_file(PROGRESS_PATH, train.dump_progress(merged).encode("utf-8"), "Прогресс тренировки",
+                               current[1] if current else None)
+            return merged
+        except ConflictError:
+            continue
+    raise StoreError("Прогресс не удалось сохранить: файл всё время менялся. Попробуй ещё раз.")

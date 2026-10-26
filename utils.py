@@ -27,6 +27,13 @@ def norm(text) -> str:
     return str(text).lower().replace("ё", "е").strip()
 
 
+def word_stem(part: str) -> str:
+    """Грубая основа слова для поиска его форм в тексте: отбрасываем окончание («кибитке» → «кибит»)."""
+    part = norm(part)
+    n = len(part)
+    return part if n <= 3 else part[:-1] if n <= 5 else part[:-2] if n <= 7 else part[:-3]
+
+
 def capitalize_first(text: str) -> str:
     """Делает заглавной только первую букву, остальное не трогает («ёлка-палка» → «Ёлка-палка»)."""
     return text[:1].upper() + text[1:]
