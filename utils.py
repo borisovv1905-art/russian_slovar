@@ -32,21 +32,19 @@ def capitalize_first(text: str) -> str:
     return text[:1].upper() + text[1:]
 
 
-def load_words(path) -> tuple[list[dict], list[str]]:
-    """Читает words.yaml. Возвращает (слова, список понятных ошибок)."""
+def parse_words(text: str, name: str = "words.yaml") -> tuple[list[dict], list[str]]:
+    """Разбирает текст words.yaml. Возвращает (слова, список понятных ошибок)."""
     errors: list[str] = []
     try:
-        raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or []
-    except FileNotFoundError:
-        return [], [f"Файл {Path(path).name} не найден."]
+        raw = yaml.safe_load(text) or []
     except yaml.YAMLError as exc:
         return [], [
-            f"В файле {Path(path).name} ошибка разметки: {exc}. "
+            f"В файле {name} ошибка разметки: {exc}. "
             "Частая причина: в тексте есть двоеточие или кавычки, а сам текст не взят в двойные кавычки."
         ]
 
     if not isinstance(raw, list):
-        return [], [f"Файл {Path(path).name} должен быть списком слов."]
+        return [], [f"Файл {name} должен быть списком слов."]
 
     words: list[dict] = []
     seen: set[str] = set()
@@ -68,6 +66,15 @@ def load_words(path) -> tuple[list[dict], list[str]]:
         seen.add(key)
         words.append(word)
     return words, errors
+
+
+def load_words(path) -> tuple[list[dict], list[str]]:
+    """Читает words.yaml. Возвращает (слова, список понятных ошибок)."""
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return [], [f"Файл {Path(path).name} не найден."]
+    return parse_words(text, Path(path).name)
 
 
 def filter_words(words: list[dict], query: str = "", work: str = "", label: str = "") -> list[dict]:

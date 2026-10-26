@@ -71,7 +71,8 @@ def test_search_filters():
     assert [w["слово"] for w in filter_words(words, query="ЖЕРЕБИЙ")] == ["жеребий"]
     assert len(filter_words(words, query="полиции")) == 1  # по значению
     assert len(filter_words(words, query="шмит")) == 1  # по цитате
-    assert len(filter_words(words, work="«Метель», А. С. Пушкин")) == 3
+    metel = [w for w in words if w["произведение"] == "«Метель», А. С. Пушкин"]
+    assert len(metel) >= 3 and filter_words(words, work="«Метель», А. С. Пушкин") == metel
     assert len(filter_words(words, label="историзм")) == 1
     assert filter_words(words, query="несуществующее") == []
 
