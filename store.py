@@ -201,9 +201,50 @@ class GitHubRepo:
             raise ConflictError()
         self._fail(resp, f"запись {path}")
 
+    def delete_file(self, path: str, message: str, sha: str) -> None:
+        body = {"message": message, "sha": sha, "branch": self.branch}
+        resp = self.http.request(
+            "DELETE", f"{API}/repos/{self.repo}/contents/{path}", headers=self._headers(), json=body, timeout=30
+        )
+        if resp.status_code == 200:
+            return
+        if resp.status_code in (409, 422):
+            raise ConflictError()
+        self._fail(resp, f"удаление {path}")
+
 
 class ConflictError(Exception):
     """Файл на GitHub успел измениться между чтением и записью."""
+
+
+def _upload_image(repo, word: str, image_bytes: bytes) -> str:
+    """Кладёт картинку в images/, не затирая чужие файлы. Возвращает путь в репозитории."""
+    jpeg = prepare_image(image_bytes)
+    base = f"images/{slugify(word)}"
+    path, n = f"{base}.jpg", 2
+    while repo.get_file(path) is not None:
+        path, n = f"{base}-{n}.jpg", n + 1
+    repo.put_file(path, jpeg, f"Картинка к слову «{word}»")
+    return path
+
+
+def _commit_words(repo, transform, message: str, attempts: int = 3):
+    """Читает свежий words.yaml, применяет transform(text) → (новый_текст, результат), коммитит.
+
+    При конфликте версий (файл изменился между чтением и записью) повторяет с новым текстом.
+    """
+    for _ in range(attempts):
+        current = repo.get_file(WORDS_PATH)
+        if current is None:
+            raise StoreError("В репозитории не найден words.yaml. Проверь GITHUB_REPO, ветку и права токена.")
+        text, sha = current[0].decode("utf-8"), current[1]
+        new_text, result = transform(text)
+        try:
+            repo.put_file(WORDS_PATH, new_text.encode("utf-8"), message, sha)
+            return result
+        except ConflictError:
+            continue
+    raise StoreError("Файл со словами всё время менялся, сохранить не получилось. Попробуй ещё раз.")
 
 
 def add_word(repo, entry: dict, image_bytes: bytes | None = None, attempts: int = 3) -> dict:
@@ -213,23 +254,127 @@ def add_word(repo, entry: dict, image_bytes: bytes | None = None, attempts: int 
     """
     entry = dict(entry)
     if image_bytes:
-        jpeg = prepare_image(image_bytes)
-        base = f"images/{slugify(entry['слово'])}"
-        path, n = f"{base}.jpg", 2
-        while repo.get_file(path) is not None:
-            path, n = f"{base}-{n}.jpg", n + 1
-        repo.put_file(path, jpeg, f"Картинка к слову «{entry['слово']}»")
-        entry["картинка"] = path
+        entry["картинка"] = _upload_image(repo, entry["слово"], image_bytes)
+    return _commit_words(repo, lambda text: (append_entry(text, entry), entry), f"Добавлено слово: {entry['слово']}", attempts)
 
-    for _ in range(attempts):
-        current = repo.get_file(WORDS_PATH)
-        if current is None:
-            raise StoreError("В репозитории не найден words.yaml. Проверь GITHUB_REPO, ветку и права токена.")
-        text, sha = current[0].decode("utf-8"), current[1]
-        new_text = append_entry(text, entry)
+
+# ---------- правка и удаление ----------
+
+_ENTRY_LINE = re.compile(r"^- ", re.M)
+
+
+def _blocks(text: str):
+    """Делит файл на (начало, [(тело записи, хвост из пустых строк и комментариев)])."""
+    starts = [m.start() for m in _ENTRY_LINE.finditer(text)]
+    if not starts:
+        return text, []
+    head, blocks = text[: starts[0]], []
+    for a, b in zip(starts, starts[1:] + [len(text)]):
+        lines = text[a:b].splitlines(keepends=True)
+        end = 0
+        for idx, line in enumerate(lines):
+            if idx == 0 or line.startswith("  "):
+                end = idx + 1
+        blocks.append(("".join(lines[:end]), "".join(lines[end:])))
+    return head, blocks
+
+
+def _locate(text: str, word: str):
+    """(начало, [блоки], номер блока, запись-словарь) для слова или StoreError."""
+    import yaml
+
+    head, blocks = _blocks(text)
+    for idx, (body, _tail) in enumerate(blocks):
         try:
-            repo.put_file(WORDS_PATH, new_text.encode("utf-8"), f"Добавлено слово: {entry['слово']}", sha)
-            return entry
-        except ConflictError:
+            data = yaml.safe_load(body)
+        except yaml.YAMLError:
             continue
-    raise StoreError("Файл со словами всё время менялся, сохранить не получилось. Попробуй ещё раз.")
+        item = data[0] if isinstance(data, list) and data and isinstance(data[0], dict) else {}
+        if norm(item.get("слово", "")) == norm(word):
+            return head, blocks, idx, {k: ("" if item.get(k) is None else str(item[k]).strip()) for k in FIELDS}
+    raise StoreError(f"Слова «{word}» уже нет в файле на GitHub. Обнови страницу: возможно, его уже изменили или удалили.")
+
+
+def _assemble(head, blocks) -> str:
+    out = head + "".join(body + tail for body, tail in blocks)
+    return out if out.endswith("\n") or not out else out + "\n"
+
+
+def replace_entry(text: str, old_word: str, entry: dict):
+    """Заменяет запись old_word новой. Возвращает (новый текст, старая запись)."""
+    head, blocks, idx, old = _locate(text, old_word)
+    others = {norm(w["слово"]) for w in parse_words(text)[0] if norm(w["слово"]) != norm(old_word)}
+    if norm(entry["слово"]) in others:
+        raise StoreError(f"Слово «{entry['слово']}» уже есть в словаре.")
+    blocks[idx] = (format_entry(entry), blocks[idx][1])
+    return _check_result(_assemble(head, blocks), len(blocks), entry["слово"]), old
+
+
+def remove_entry(text: str, word: str):
+    """Удаляет запись. Возвращает (новый текст, удалённая запись). Комментарии рядом остаются."""
+    head, blocks, idx, old = _locate(text, word)
+    _body, tail = blocks.pop(idx)
+    if idx > 0:
+        blocks[idx - 1] = (blocks[idx - 1][0], blocks[idx - 1][1] + tail)
+    else:
+        head += tail
+    return _check_result(_assemble(head, blocks), len(blocks), None), old
+
+
+def _check_result(new_text: str, expected_count: int, word):
+    words, errors = parse_words(new_text)
+    if errors or len(words) != expected_count or (word and norm(word) not in {norm(w["слово"]) for w in words}):
+        raise StoreError("Не получилось безопасно изменить файл: после правки он не прошёл проверку. Ничего не записано.")
+    return new_text
+
+
+def _image_unused(text: str, path: str) -> bool:
+    words, _ = parse_words(text)
+    return all(w["картинка"] != path for w in words)
+
+
+def _deletable_image(path: str) -> bool:
+    return bool(path) and path.startswith("images/") and not path.startswith("images/src/") and ".." not in path
+
+
+def _drop_image(repo, path: str, word: str) -> None:
+    """Удаляет файл картинки (с запасом на ошибки: слово уже сохранено, лишний файл не страшен)."""
+    try:
+        current = repo.get_file(path)
+        if current is not None:
+            repo.delete_file(path, f"Удалена картинка слова «{word}»", current[1])
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def update_word(repo, old_word: str, entry: dict, image_bytes: bytes | None = None, remove_image: bool = False) -> dict:
+    """Меняет слово. entry — новые поля (картинка: прежний путь или пусто). Возвращает записанную запись."""
+    entry = dict(entry)
+    new_path = _upload_image(repo, entry["слово"], image_bytes) if image_bytes else None
+    if new_path:
+        entry["картинка"] = new_path
+    elif remove_image:
+        entry["картинка"] = ""
+        entry["картинка_источник"] = ""
+
+    def transform(text):
+        new_text, old = replace_entry(text, old_word, entry)
+        return new_text, (new_text, old)
+
+    new_text, old = _commit_words(repo, transform, f"Изменено слово: {entry['слово']}")
+    if old["картинка"] != entry["картинка"] and _deletable_image(old["картинка"]) and _image_unused(new_text, old["картинка"]):
+        _drop_image(repo, old["картинка"], entry["слово"])
+    return entry
+
+
+def delete_word(repo, word: str, delete_image: bool = True) -> dict:
+    """Удаляет слово (и его картинку, если она больше нигде не нужна). Возвращает удалённую запись."""
+
+    def transform(text):
+        new_text, old = remove_entry(text, word)
+        return new_text, (new_text, old)
+
+    new_text, old = _commit_words(repo, transform, f"Удалено слово: {word}")
+    if delete_image and _deletable_image(old["картинка"]) and _image_unused(new_text, old["картинка"]):
+        _drop_image(repo, old["картинка"], word)
+    return old

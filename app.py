@@ -6,6 +6,7 @@ from pathlib import Path
 
 import streamlit as st
 
+import lookup
 import store
 from utils import capitalize_first, filter_words, load_words, norm, sort_words, unique_values, word_of_day
 
@@ -83,35 +84,161 @@ NO_LABEL, NO_WORK, OTHER_WORK = "— без пометки —", "— не ук�
 MAX_PASSWORD_FAILS = 5
 
 
-def add_tab(words: list[dict]):
-    """Вкладка «Добавить слово»: пароль, форма, коммит в GitHub."""
+def login_ok(where: str) -> bool:
+    """Пароль для вкладок добавления и правки. True, если вход выполнен."""
     password, token = secret("ADD_PASSWORD"), secret("GITHUB_TOKEN")
     if not password or not token:
         st.info(
-            "Добавление слов из приложения ещё не настроено. "
+            "Изменение слов из приложения ещё не настроено. "
             "В настройках приложения (Settings → Secrets) нужны `ADD_PASSWORD` и `GITHUB_TOKEN`, "
             "подробности в README."
         )
-        return
-
-    # --- вход по паролю ---
+        return False
+    if st.session_state.get("add_ok"):
+        return True
     fails = st.session_state.get("pw_fails", 0)
-    if not st.session_state.get("add_ok"):
-        if fails >= MAX_PASSWORD_FAILS:
-            st.error("Слишком много неверных попыток. Обнови страницу и попробуй снова.")
-            return
-        with st.form("login"):
-            entered = st.text_input("Пароль", type="password")
-            if st.form_submit_button("Войти"):
-                if store.check_password(entered, password):
-                    st.session_state["add_ok"] = True
-                    st.session_state["pw_fails"] = 0
-                    st.rerun()
-                else:
-                    st.session_state["pw_fails"] = fails + 1
-                    st.error("Неверный пароль.")
-        return
+    if fails >= MAX_PASSWORD_FAILS:
+        st.error("Слишком много неверных попыток. Обнови страницу и попробуй снова.")
+        return False
+    with st.form(f"login_{where}"):
+        entered = st.text_input("Пароль", type="password", key=f"pw_{where}")
+        if st.form_submit_button("Войти"):
+            if store.check_password(entered, password):
+                st.session_state["add_ok"] = True
+                st.session_state["pw_fails"] = 0
+                st.rerun()
+            else:
+                st.session_state["pw_fails"] = fails + 1
+                st.error("Неверный пароль.")
+    return False
 
+
+def get_repo() -> store.GitHubRepo:
+    return store.GitHubRepo(
+        secret("GITHUB_REPO", "borisovv1905-art/russian_slovar"), secret("GITHUB_TOKEN"), secret("GITHUB_BRANCH", "main")
+    )
+
+
+def run_save(action, success_text: str) -> bool:
+    """Выполняет сохранение в GitHub с понятными сообщениями об ошибках."""
+    try:
+        with st.spinner("Сохраняю в GitHub…"):
+            action()
+    except store.StoreError as exc:
+        st.error(str(exc))
+        return False
+    except Exception:  # сеть и прочее непредвиденное: подробности токена не показываем
+        st.error("Не получилось связаться с GitHub. Проверь интернет и попробуй ещё раз.")
+        return False
+    st.session_state["flash"] = success_text
+    st.session_state["form_n"] = st.session_state.get("form_n", 0) + 1
+    return True
+
+
+def suggest_into_form(word_key: str, meaning_key: str, label_key: str, label_options: list[str]):
+    """Нажатие «Подсказать значение»: черновик значения и пометки из Викисловаря (правится руками)."""
+    senses = lookup.suggest_meaning(st.session_state.get(word_key, ""))
+    st.session_state["suggest_senses"] = senses
+    if senses:
+        st.session_state[meaning_key] = senses[0]["text"]
+        for lab in senses[0]["labels"]:
+            if lab in label_options:
+                st.session_state[label_key] = lab
+                break
+
+
+def entry_form(words: list[dict], prefix: str, defaults: dict | None = None):
+    """Поля слова. Возвращает (запись или None, текст проблемы, картинка-байты, убрать ли картинку)."""
+    d = defaults or {}
+    key = lambda name: f"{prefix}_{name}"  # noqa: E731
+
+    word = st.text_input("Слово", key=key("w"), value=d.get("слово", ""), placeholder="например: шлафорка")
+    taken = {norm(w["слово"]) for w in words if norm(w["слово"]) != norm(d.get("слово", ""))}
+    if word and norm(word) in taken:
+        st.warning("Такое слово уже есть в словаре.")
+
+    label_options = [NO_LABEL] + sorted(set(unique_values(words, "пометка")) | set(COMMON_LABELS) | ({d["пометка"]} if d.get("пометка") else set()), key=norm)
+    if not d:
+        st.button("🔎 Подсказать значение из Викисловаря", key=key("sg"), on_click=suggest_into_form,
+                  args=(key("w"), key("m"), key("l"), label_options))
+        senses = st.session_state.get("suggest_senses")
+        if senses:
+            others = [s["text"] for s in senses[1:]]
+            st.caption("Подставил первое значение, проверь и поправь." + (" Другие значения: " + "; ".join(others) if others else ""))
+        elif senses is not None and word:
+            st.caption("В Викисловаре ничего не нашлось (или сайт не ответил). Впиши значение сам.")
+    meaning = st.text_area("Значение", key=key("m"), value=d.get("значение", ""), height=90)
+
+    col_label, col_work = st.columns(2)
+    with col_label:
+        label = st.selectbox("Пометка", label_options, key=key("l"),
+                             index=label_options.index(d["пометка"]) if d.get("пометка") in label_options else 0)
+    with col_work:
+        fresh = {w["произведение"] for w in st.session_state.get("added", []) if w["произведение"]}
+        works = [NO_WORK] + sorted(set(unique_values(words, "произведение")) | fresh, key=norm) + [OTHER_WORK]
+        preferred = d.get("произведение") or st.session_state.get("last_work", "")
+        chosen_work = st.selectbox("Произведение", works, key=key("p"), index=works.index(preferred) if preferred in works else 0)
+    work = ""
+    if chosen_work == OTHER_WORK:
+        c1, c2 = st.columns(2)
+        title = c1.text_input("Название произведения", key=key("t"), placeholder="Станционный смотритель")
+        author = c2.text_input("Автор", key=key("a"), placeholder="А. С. Пушкин")
+        if title:
+            work = f"«{title.strip().strip('«»')}»" + (f", {author.strip()}" if author.strip() else "")
+    elif chosen_work != NO_WORK:
+        work = chosen_work
+
+    quote = st.text_area("Цитата с этим словом (без кавычек)", key=key("q"), value=d.get("цитата", ""), height=70)
+    clean_q = store.clean_quote(quote)
+    if word and clean_q and not lookup.quote_has_word(word, clean_q):
+        st.caption("⚠️ Слова «" + word.strip() + "» в цитате не видно. Если оно в другой форме, это нормально, но проверь, ту ли цитату вставил.")
+    if st.button("📚 Проверить цитату по Викитеке", key=key("cq"), disabled=len(clean_q.split()) < 3):
+        hits = lookup.search_wikisource(clean_q)
+        if hits:
+            st.success("Цитата нашлась: " + "; ".join(f"[{h['title']}]({h['url']})" for h in hits))
+            if hits[0]["snippet"]:
+                st.caption("…" + hits[0]["snippet"] + "…")
+        else:
+            st.info("В Викитеке такой цитаты не нашлось. Возможно, другая орфография или издание, "
+                    "поэтому сверь с книгой. Это только подсказка.")
+
+    current_image = d.get("картинка", "")
+    remove_image = False
+    if current_image:
+        remove_image = st.checkbox("Убрать картинку", key=key("rm"))
+    image_file = st.file_uploader(
+        "Новая картинка (необязательно): JPG, PNG или WEBP" if current_image else "Картинка (необязательно): JPG, PNG или WEBP",
+        type=["jpg", "jpeg", "png", "webp"], key=key("f"),
+    )
+    image_bytes = image_file.getvalue() if image_file else None
+    image_source_text = ""
+    if image_bytes or (current_image and not remove_image):
+        image_source_text = st.text_input("Откуда картинка (автор, лицензия, ссылка)", key=key("s"), value=d.get("картинка_источник", ""))
+
+    try:
+        entry = store.build_entry(
+            word=word, meaning=meaning, label="" if label == NO_LABEL else label, work=work, quote=quote,
+            image_path="" if (remove_image or image_bytes) else current_image, image_source=image_source_text,
+            added=None,
+        )
+        if d.get("добавлено"):
+            entry["добавлено"] = d["добавлено"]
+        problem = ""
+    except store.StoreError as exc:
+        entry, problem = None, str(exc)
+    return entry, problem, image_bytes, remove_image
+
+
+def show_flash():
+    flash = st.session_state.pop("flash", None)
+    if flash:
+        st.success(flash)
+
+
+def add_tab(words: list[dict]):
+    """Вкладка «Добавить слово»."""
+    if not login_ok("add"):
+        return
     top_left, top_right = st.columns([4, 1])
     with top_left:
         st.caption("Новое слово сохранится в GitHub, а в словаре появится через минуту-две, когда приложение обновится.")
@@ -119,75 +246,24 @@ def add_tab(words: list[dict]):
         if st.button("Выйти"):
             st.session_state["add_ok"] = False
             st.rerun()
-
-    flash = st.session_state.pop("flash", None)
-    if flash:
-        st.success(flash)
+    show_flash()
 
     n = st.session_state.get("form_n", 0)  # меняется после сохранения: так поля очищаются
-    k = lambda name: f"{name}_{n}"  # noqa: E731
+    entry, problem, image_bytes, _ = entry_form(words, f"add{n}")
 
-    word = st.text_input("Слово", key=k("w"), placeholder="например: шлафорка")
-    if word and norm(word) in {norm(w["слово"]) for w in words}:
-        st.warning("Такое слово уже есть в словаре.")
-    meaning = st.text_area("Значение", key=k("m"), height=90)
-
-    col_label, col_work = st.columns(2)
-    with col_label:
-        labels = [NO_LABEL] + sorted(set(unique_values(words, "пометка")) | set(COMMON_LABELS), key=norm)
-        label = st.selectbox("Пометка", labels, key=k("l"))
-    with col_work:
-        works = [NO_WORK] + unique_values(words, "произведение") + [OTHER_WORK]
-        chosen_work = st.selectbox("Произведение", works, key=k("p"))
-    work = ""
-    if chosen_work == OTHER_WORK:
-        c1, c2 = st.columns(2)
-        title = c1.text_input("Название произведения", key=k("t"), placeholder="Станционный смотритель")
-        author = c2.text_input("Автор", key=k("a"), placeholder="А. С. Пушкин")
-        if title:
-            work = f"«{title.strip().strip('«»')}»" + (f", {author.strip()}" if author.strip() else "")
-    elif chosen_work != NO_WORK:
-        work = chosen_work
-
-    quote = st.text_area("Цитата с этим словом (без кавычек)", key=k("q"), height=70)
-
-    image_file = st.file_uploader("Картинка (необязательно): JPG, PNG или WEBP", type=["jpg", "jpeg", "png", "webp"], key=k("f"))
-    image_bytes = image_file.getvalue() if image_file else None
-    image_source_text = ""
-    if image_bytes:
-        image_source_text = st.text_input("Откуда картинка (автор, лицензия, ссылка)", key=k("s"))
-
-    try:
-        preview = store.build_entry(word=word, meaning=meaning, label="" if label == NO_LABEL else label,
-                                    work=work, quote=quote, image_source=image_source_text)
-        problem = ""
-    except store.StoreError as exc:
-        preview, problem = None, str(exc)
-
-    if preview:
+    if entry:
         st.markdown("**Так слово будет выглядеть в словаре:**")
-        shown = {k_: preview[k_] for k_ in preview}
-        show_word(shown, uploaded=image_bytes)
-    elif word or meaning:
+        show_word(dict(entry), uploaded=image_bytes)
+    elif problem and any(st.session_state.get(f"add{n}_{f}") for f in ("w", "m")):
         st.caption(problem)
 
-    if st.button("Сохранить слово", type="primary", disabled=preview is None):
-        try:
-            with st.spinner("Сохраняю в GitHub…"):
-                repo = store.GitHubRepo(
-                    secret("GITHUB_REPO", "borisovv1905-art/russian_slovar"), token, secret("GITHUB_BRANCH", "main")
-                )
-                saved = store.add_word(repo, preview, image_bytes)
-        except store.StoreError as exc:
-            st.error(str(exc))
-        except Exception:  # сеть и прочее непредвиденное: подробности токена не показываем
-            st.error("Не получилось связаться с GitHub. Проверь интернет и попробуй ещё раз.")
-        else:
-            st.session_state.setdefault("added", []).append(saved)
-            st.session_state["flash"] = (
-                f"Слово «{capitalize_first(saved['слово'])}» сохранено. Оно появится в словаре через минуту-две."
-            )
-            st.session_state["form_n"] = n + 1
+    if st.button("Сохранить слово", type="primary", disabled=entry is None):
+        if run_save(lambda: store.add_word(get_repo(), entry, image_bytes),
+                    f"Слово «{capitalize_first(entry['слово'])}» сохранено. Оно появится в словаре через минуту-две."):
+            st.session_state.setdefault("added", []).append(entry)
+            if entry["произведение"]:
+                st.session_state["last_work"] = entry["произведение"]
+            st.session_state["suggest_senses"] = None
             st.rerun()
 
     added = st.session_state.get("added", [])
@@ -195,6 +271,41 @@ def add_tab(words: list[dict]):
         st.divider()
         st.markdown("**Сохранено в этом сеансе** (пока приложение обновляется, в словаре этих слов может не быть):")
         st.write(", ".join(capitalize_first(w["слово"]) for w in added))
+
+
+def edit_tab(words: list[dict]):
+    """Вкладка «Править / удалить»."""
+    if not login_ok("edit"):
+        return
+    show_flash()
+    if not words:
+        st.info("Пока нечего править: в словаре нет слов.")
+        return
+    names = [w["слово"] for w in sort_words(words, "az")]
+    chosen = st.selectbox("Какое слово править", names, format_func=capitalize_first, key="edit_pick")
+    old = next(w for w in words if w["слово"] == chosen)
+    n = st.session_state.get("form_n", 0)
+    st.caption("Правки сохранятся в GitHub и появятся в словаре через минуту-две.")
+
+    entry, problem, image_bytes, remove_image = entry_form(words, f"edit{n}_{store.slugify(chosen)}", defaults=old)
+    if entry:
+        st.markdown("**Так слово будет выглядеть:**")
+        show_word(dict(entry), uploaded=image_bytes)
+    else:
+        st.caption(problem)
+    if st.button("Сохранить изменения", type="primary", disabled=entry is None):
+        if run_save(lambda: store.update_word(get_repo(), old["слово"], entry, image_bytes, remove_image),
+                    f"Изменения слова «{capitalize_first(entry['слово'])}» сохранены. В словаре они появятся через минуту-две."):
+            st.rerun()
+
+    with st.expander("Удалить это слово"):
+        st.warning(f"Слово «{capitalize_first(old['слово'])}» исчезнет из словаря. В истории GitHub его можно будет найти, но из приложения вернуть нельзя.")
+        sure = st.checkbox("Да, удалить это слово", key=f"del_sure_{n}_{store.slugify(chosen)}")
+        with_image = st.checkbox("Вместе с картинкой (если она больше нигде не нужна)", value=True, key=f"del_img_{n}_{store.slugify(chosen)}")
+        if st.button("Удалить слово", disabled=not sure):
+            if run_save(lambda: store.delete_word(get_repo(), old["слово"], with_image),
+                        f"Слово «{capitalize_first(old['слово'])}» удалено. Из словаря оно пропадёт через минуту-две."):
+                st.rerun()
 
 
 # ---------- данные ----------
@@ -205,10 +316,13 @@ st.caption(f"Слов в словаре: {len(words)}")
 for problem in problems:
     st.warning(problem)
 
-tab_dict, tab_add = st.tabs(["📖 Словарь", "➕ Добавить слово"])
+tab_dict, tab_add, tab_edit = st.tabs(["📖 Словарь", "➕ Добавить слово", "✏️ Править / удалить"])
 
 with tab_add:
     add_tab(words)
+
+with tab_edit:
+    edit_tab(words)
 
 with tab_dict:
     if not words:

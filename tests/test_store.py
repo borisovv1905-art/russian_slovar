@@ -28,6 +28,11 @@ class FakeRepo:
     def get_file(self, path):
         return self.files.get(path)
 
+    def delete_file(self, path, message, sha):
+        self.deleted = getattr(self, "deleted", [])
+        self.deleted.append(path)
+        del self.files[path]
+
     def put_file(self, path, content, message, sha=None):
         if path == "words.yaml" and self.conflicts > 0:
             self.conflicts -= 1
@@ -164,6 +169,89 @@ def test_duplicate_found_on_github_side_even_if_page_is_stale():
     assert repo.puts == []
 
 
+def test_edit_changes_only_that_word():
+    new = entry(word="Кибитка", meaning="новая повозка")
+    text, old = store.replace_entry(REAL_YAML, "кибитка", new)
+    words, errors = parse_words(text)
+    assert errors == [] and len(words) == len(parse_words(REAL_YAML)[0])
+    by = {w["слово"]: w for w in words}
+    assert by["Кибитка"]["значение"] == "новая повозка"
+    assert old["картинка"] == "images/kibitka.jpg"
+    before = {w["слово"]: w for w in parse_words(REAL_YAML)[0]}
+    assert all(by[k] == v for k, v in before.items() if k != "кибитка")
+    assert text.startswith(REAL_YAML[: REAL_YAML.index("- слово")])  # шапка с пояснениями цела
+
+
+def test_edit_rename_conflict_and_missing():
+    for fn, part in (
+        (lambda: store.replace_entry(REAL_YAML, "кибитка", entry(word="землемер")), "уже есть"),
+        (lambda: store.replace_entry(REAL_YAML, "нету такого", entry()), "уже нет в файле"),
+        (lambda: store.remove_entry(REAL_YAML, "нету такого"), "уже нет в файле"),
+    ):
+        exc = _raises(fn)
+        assert isinstance(exc, StoreError) and part in str(exc), exc
+    # переименование самого себя (регистр) не считается дублем
+    store.replace_entry(REAL_YAML, "кибитка", entry(word="Кибитка"))
+
+
+def test_remove_entry_keeps_others_and_comments():
+    text = "# шапка\n\n- слово: \"а\"\n  значение: \"1\"\n\n# про б\n- слово: \"б\"\n  значение: \"2\"\n\n- слово: \"в\"\n  значение: \"3\"\n"
+    for gone, left in (("а", ["б", "в"]), ("б", ["а", "в"]), ("в", ["а", "б"])):
+        new, old = store.remove_entry(text, gone)
+        words, errors = parse_words(new)
+        assert errors == [] and [w["слово"] for w in words] == left and old["слово"] == gone
+        assert new.startswith("# шапка")
+    only = '- слово: "а"\n  значение: "1"\n'
+    new, _ = store.remove_entry(only, "а")
+    assert parse_words(new)[0] == []
+
+
+def test_update_word_replaces_image_and_cleans_old_one():
+    repo = FakeRepo()
+    repo.files["images/kibitka.jpg"] = (b"old", "shaK")
+    saved = store.update_word(repo, "кибитка", entry(word="кибитка", meaning="m"), image_bytes=png_bytes())
+    assert saved["картинка"] == "images/kibitka-2.jpg"
+    assert repo.deleted == ["images/kibitka.jpg"]
+    words, _ = parse_words(repo.files["words.yaml"][0].decode())
+    assert {w["слово"]: w["картинка"] for w in words}["кибитка"] == "images/kibitka-2.jpg"
+
+
+def test_update_word_remove_image_and_keep_image():
+    repo = FakeRepo()
+    repo.files["images/kibitka.jpg"] = (b"old", "shaK")
+    store.update_word(repo, "кибитка", entry(word="кибитка", meaning="m", image_path="images/kibitka.jpg"))
+    assert getattr(repo, "deleted", []) == []        # картинку не трогали
+    store.update_word(repo, "кибитка", entry(word="кибитка", meaning="m"), remove_image=True)
+    assert repo.deleted == ["images/kibitka.jpg"]
+
+
+def test_shared_image_is_not_deleted():
+    base = REAL_YAML + '\n- слово: "двойник"\n  значение: "x"\n  картинка: "images/kibitka.jpg"\n'
+    repo = FakeRepo({"words.yaml": base.encode(), "images/kibitka.jpg": b"img"})
+    store.delete_word(repo, "двойник")           # картинка нужна ещё кибитке — остаётся
+    assert getattr(repo, "deleted", []) == []
+    store.delete_word(repo, "кибитка")           # теперь она никому не нужна
+    assert repo.deleted == ["images/kibitka.jpg"]
+
+
+def test_delete_word_and_protect_paths():
+    repo = FakeRepo()
+    old = store.delete_word(repo, "землемер", delete_image=False)
+    assert old["слово"] == "землемер"
+    assert "землемер" not in [w["слово"] for w in parse_words(repo.files["words.yaml"][0].decode())[0]]
+    assert getattr(repo, "deleted", []) == []
+    for bad in ("../x.jpg", "images/src/a.svg", "words.yaml", ""):
+        assert not store._deletable_image(bad)
+    assert store._deletable_image("images/a.jpg")
+
+
+def test_edit_conflict_retried_on_fresh_text():
+    repo = FakeRepo(conflicts=1)
+    store.update_word(repo, "кибитка", entry(word="кибитка", meaning="новое"))
+    final = repo.files["words.yaml"][0].decode()
+    assert "# чужая правка" in final and "новое" in final
+
+
 class Resp:
     def __init__(self, code, data=None):
         self.status_code, self._data = code, data
@@ -212,6 +300,18 @@ def test_github_errors_are_friendly_and_hide_token():
     assert isinstance(_raises(lambda: store.GitHubRepo("a/b", "")), StoreError)
     gh = store.GitHubRepo("a/b", "t", http=FakeHttp(put=Resp(409)))
     assert isinstance(_raises(lambda: gh.put_file("x", b"1", "m")), ConflictError)
+
+
+def test_github_delete_request():
+    class H(FakeHttp):
+        def request(self, method, url, **kw):
+            self.calls.append((method, url, kw))
+            return Resp(200)
+    h = H()
+    store.GitHubRepo("a/b", "t", http=h).delete_file("images/x.jpg", "msg", "sha9")
+    method, url, kw = h.calls[0]
+    assert method == "DELETE" and url.endswith("/contents/images/x.jpg")
+    assert kw["json"] == {"message": "msg", "sha": "sha9", "branch": "main"}
 
 
 def _raises(fn):
