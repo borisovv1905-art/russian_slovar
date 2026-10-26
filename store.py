@@ -15,13 +15,13 @@ from datetime import date, datetime, timedelta, timezone
 
 from PIL import Image
 
-from utils import FIELDS, norm, parse_words
+from utils import FIELDS, norm, parse_reviews, parse_words, split_tags
 
 API = "https://api.github.com"
 WORDS_PATH = "words.yaml"
 MAX_IMAGE_BYTES = 8 * 1024 * 1024
 MAX_IMAGE_WIDTH = 900
-LIMITS = {"слово": 60, "значение": 700, "пометка": 40, "произведение": 150, "цитата": 700, "картинка_источник": 200}
+LIMITS = {"слово": 60, "теги": 120, "значение": 700, "пометка": 40, "произведение": 150, "цитата": 700, "картинка_источник": 200}
 
 _TRANSLIT = dict(zip(
     "абвгдеёжзийклмнопрстуфхцчшщъыьэюя",
@@ -66,12 +66,13 @@ def clean_quote(text: str) -> str:
     return t
 
 
-def build_entry(*, word, meaning, label="", work="", quote="", image_path="", image_source="", added=None) -> dict:
+def build_entry(*, word, meaning, label="", work="", quote="", image_path="", image_source="", added=None, tags="") -> dict:
     """Собирает запись, проверяет обязательные поля и длины."""
     entry = {
         "слово": clean_text(word),
         "значение": clean_text(meaning),
         "пометка": clean_text(label),
+        "теги": ", ".join(split_tags(tags)),
         "произведение": clean_text(work),
         "цитата": clean_quote(quote),
         "картинка": image_path,
@@ -249,23 +250,28 @@ def _upload_image(repo, word: str, image_bytes: bytes) -> str:
     return path
 
 
-def _commit_words(repo, transform, message: str, attempts: int = 3):
-    """Читает свежий words.yaml, применяет transform(text) → (новый_текст, результат), коммитит.
+def _commit_text(repo, path: str, transform, message: str, attempts: int = 3, create_ok: bool = False):
+    """Читает свежий текстовый файл, применяет transform(text) → (новый_текст, результат), коммитит.
 
     При конфликте версий (файл изменился между чтением и записью) повторяет с новым текстом.
+    create_ok: если файла ещё нет, начать с пустого текста.
     """
     for _ in range(attempts):
-        current = repo.get_file(WORDS_PATH)
-        if current is None:
-            raise StoreError("В репозитории не найден words.yaml. Проверь GITHUB_REPO, ветку и права токена.")
-        text, sha = current[0].decode("utf-8"), current[1]
+        current = repo.get_file(path)
+        if current is None and not create_ok:
+            raise StoreError(f"В репозитории не найден {path}. Проверь GITHUB_REPO, ветку и права токена.")
+        text, sha = (current[0].decode("utf-8"), current[1]) if current else ("", None)
         new_text, result = transform(text)
         try:
-            repo.put_file(WORDS_PATH, new_text.encode("utf-8"), message, sha)
+            repo.put_file(path, new_text.encode("utf-8"), message, sha)
             return result
         except ConflictError:
             continue
-    raise StoreError("Файл со словами всё время менялся, сохранить не получилось. Попробуй ещё раз.")
+    raise StoreError("Файл всё время менялся, сохранить не получилось. Попробуй ещё раз.")
+
+
+def _commit_words(repo, transform, message: str, attempts: int = 3):
+    return _commit_text(repo, WORDS_PATH, transform, message, attempts)
 
 
 def add_word(repo, entry: dict, image_bytes: bytes | None = None, attempts: int = 3) -> dict:
@@ -436,3 +442,42 @@ def save_progress(prog_repo, progress: dict, attempts: int = 3) -> dict:
         except ConflictError:
             continue
     raise StoreError("Прогресс не удалось сохранить: файл всё время менялся. Попробуй ещё раз.")
+
+
+# ---------- рецензии на произведения ----------
+
+REVIEWS_PATH = "reviews.yaml"
+REVIEWS_HEADER = (
+    "# Ссылки на рецензии в канале «Второе чтение»: произведение (как в words.yaml) → ссылка на пост.\n"
+    "# Обычно этот файл правится во вкладке «Править / удалить», но руками тоже можно.\n"
+)
+
+
+def validate_review_url(url: str) -> str:
+    url = clean_text(url)
+    if not re.match(r"^https?://\S+$", url) or len(url) > 300:
+        raise StoreError("Ссылка должна начинаться с https:// (например, https://t.me/канал/12) и быть без пробелов.")
+    return url
+
+
+def format_reviews(reviews: dict) -> str:
+    lines = [f"{json.dumps(k, ensure_ascii=False)}: {json.dumps(v, ensure_ascii=False)}" for k, v in sorted(reviews.items())]
+    return REVIEWS_HEADER + ("\n".join(lines) + "\n" if lines else "")
+
+
+def set_review(repo, work: str, url: str) -> dict:
+    """Задаёт ссылку на рецензию к произведению; пустая ссылка убирает запись. Возвращает новый словарь."""
+    work = clean_text(work)
+    if not work:
+        raise StoreError("Выбери произведение.")
+    url = validate_review_url(url) if clean_text(url) else ""
+
+    def transform(text):
+        reviews = parse_reviews(text)
+        if url:
+            reviews[work] = url
+        else:
+            reviews.pop(work, None)
+        return format_reviews(reviews), reviews
+
+    return _commit_text(repo, REVIEWS_PATH, transform, f"Рецензия: {work}" if url else f"Убрана рецензия: {work}", create_ok=True)

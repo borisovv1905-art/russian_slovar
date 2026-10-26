@@ -7,13 +7,18 @@ from pathlib import Path
 
 import streamlit as st
 
+import card
+import export
 import lookup
 import store
 import train
-from utils import capitalize_first, filter_words, load_words, norm, sort_words, unique_values, word_of_day
+import utils
+from utils import (capitalize_first, filter_words, load_reviews, load_words, norm, sort_words, split_tags, unique_tags,
+                   unique_values, word_of_day)
 
 BASE = Path(__file__).resolve().parent
 WORDS_FILE = BASE / "words.yaml"
+REVIEWS_FILE = BASE / "reviews.yaml"
 
 st.set_page_config(page_title="Словарь прочитанного", page_icon="📖", layout="wide")
 
@@ -22,6 +27,19 @@ st.set_page_config(page_title="Словарь прочитанного", page_ic
 def get_words(file_version: float):
     """Читает файл заново только тогда, когда он изменился (file_version — время правки)."""
     return load_words(WORDS_FILE)
+
+
+@st.cache_data
+def get_reviews(file_version: float):
+    return load_reviews(REVIEWS_FILE)
+
+
+def image_bytes_from_repo(path_text: str) -> bytes | None:
+    """Файл картинки из папки проекта (для карточки и выгрузки) или None."""
+    source = image_source(path_text)
+    if source and not source.startswith("http"):
+        return Path(source).read_bytes()
+    return None
 
 
 def image_source(path_text: str):
@@ -53,7 +71,7 @@ def show_image(word: dict, uploaded: bytes | None = None):
         st.caption(word["картинка_источник"])
 
 
-def show_word(word: dict, uploaded: bytes | None = None, learned: bool = False):
+def show_word(word: dict, uploaded: bytes | None = None, learned: bool = False, review_url: str = ""):
     """Карточка слова: слева картинка, справа текст."""
     with st.container(border=True):
         left, right = st.columns([1, 2])
@@ -66,12 +84,16 @@ def show_word(word: dict, uploaded: bytes | None = None, learned: bool = False):
             if learned:
                 title += " &nbsp; :green[✅ выучено]"
             st.markdown(title)
+            if word.get("теги"):
+                st.caption("🏷 " + ", ".join(split_tags(word["теги"])))
             st.write(word["значение"])
             if word["цитата"]:
                 source = f"\n>\n> — *{word['произведение']}*" if word["произведение"] else ""
                 st.markdown(f"> «{word['цитата']}»{source}")
             elif word["произведение"]:
                 st.caption(word["произведение"])
+            if review_url:
+                st.markdown(f"[📝 Рецензия в канале «Второе чтение»]({review_url})")
 
 
 # ---------- настройки (Secrets) ----------
@@ -192,6 +214,11 @@ def entry_form(words: list[dict], prefix: str, defaults: dict | None = None):
     elif chosen_work != NO_WORK:
         work = chosen_work
 
+    tags_text = st.text_input("Теги (через запятую)", key=key("tg"), value=d.get("теги", ""), placeholder="например: одежда, быт")
+    existing_tags = unique_tags(words)
+    if existing_tags:
+        st.caption("Уже есть: " + ", ".join(existing_tags[:30]))
+
     quote = st.text_area("Цитата с этим словом (без кавычек)", key=key("q"), value=d.get("цитата", ""), height=70)
     clean_q = store.clean_quote(quote)
     if word and clean_q and not lookup.quote_has_word(word, clean_q):
@@ -221,7 +248,7 @@ def entry_form(words: list[dict], prefix: str, defaults: dict | None = None):
 
     try:
         entry = store.build_entry(
-            word=word, meaning=meaning, label="" if label == NO_LABEL else label, work=work, quote=quote,
+            word=word, meaning=meaning, label="" if label == NO_LABEL else label, work=work, quote=quote, tags=tags_text,
             image_path="" if (remove_image or image_bytes) else current_image, image_source=image_source_text,
             added=None,
         )
@@ -301,6 +328,19 @@ def edit_tab(words: list[dict]):
         if run_save(lambda: store.update_word(get_repo(), old["слово"], entry, image_bytes, remove_image),
                     f"Изменения слова «{capitalize_first(entry['слово'])}» сохранены. В словаре они появятся через минуту-две."):
             st.rerun()
+
+    with st.expander("📝 Ссылка на рецензию к произведению"):
+        review_works = unique_values(words, "произведение")
+        if not review_works:
+            st.caption("Сначала нужны слова с указанным произведением.")
+        else:
+            rev_work = st.selectbox("Произведение", review_works, key="rev_work")
+            rev_url = st.text_input("Ссылка на рецензию в канале (пусто: убрать ссылку)", key=f"rev_url_{store.slugify(rev_work)}",
+                                    value=reviews.get(rev_work, ""), placeholder="https://t.me/имя_канала/12")
+            if st.button("Сохранить ссылку", key="rev_save"):
+                if run_save(lambda: store.set_review(get_repo(), rev_work, rev_url),
+                            f"Ссылка на рецензию к «{rev_work}» сохранена. На карточках она появится через минуту-две."):
+                    st.rerun()
 
     with st.expander("Удалить это слово"):
         st.warning(f"Слово «{capitalize_first(old['слово'])}» исчезнет из словаря. В истории GitHub его можно будет найти, но из приложения вернуть нельзя.")
@@ -497,15 +537,154 @@ def train_tab(words: list[dict]):
                     st.rerun()
 
 
+# ---------- оформление ----------
+FONTS = {
+    "serif": ("Как в теме (с засечками)", None),
+    "georgia": ("Georgia (для чтения)", "Georgia, 'Times New Roman', serif"),
+    "sans": ("Без засечек", "'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif"),
+    "mono": ("Моноширинный", "'Courier New', Courier, monospace"),
+}
+SIZES = {"s": ("Мелкий", 90), "m": ("Обычный", 100), "l": ("Крупный", 115), "xl": ("Очень крупный", 130)}
+
+
+def appearance():
+    """Шрифт и размер текста. Выбор хранится в адресе страницы (?font=…&size=…), поэтому он запоминается закладкой."""
+    params = st.query_params
+    font_code = params.get("font", "serif")
+    size_code = params.get("size", "m")
+    font_code = font_code if font_code in FONTS else "serif"
+    size_code = size_code if size_code in SIZES else "m"
+    with st.sidebar.expander("🎨 Оформление"):
+        font = st.selectbox("Шрифт", list(FONTS), index=list(FONTS).index(font_code), format_func=lambda c: FONTS[c][0], key="ui_font")
+        size = st.selectbox("Размер текста", list(SIZES), index=list(SIZES).index(size_code), format_func=lambda c: SIZES[c][0], key="ui_size")
+        st.caption("Тёмная тема: меню ⋮ вверху справа → Settings → Theme. Шрифт и размер запоминаются в адресе страницы, "
+                   "добавь её в закладки уже с выбранными настройками.")
+    if font != font_code:
+        params["font"] = font
+    if size != size_code:
+        params["size"] = size
+    css = f"html {{ font-size: {SIZES[size][1]}%; }}"
+    family = FONTS[font][1]
+    if family:
+        css += (".stApp, .stApp p, .stApp li, .stApp label, .stApp input, .stApp textarea, .stApp button, "
+                ".stApp h1, .stApp h2, .stApp h3, .stApp h4, .stApp h5, .stApp h6, "
+                f".stApp [data-testid='stMarkdownContainer'] {{ font-family: {family} !important; }}")
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
+
+
+# ---------- полка и статистика ----------
+def shelf_tab(words: list[dict], progress, reviews: dict):
+    if not words:
+        st.info("Пока пусто: добавь первые слова.")
+        return
+    info = utils.summary(words)
+    cols = st.columns(4)
+    cols[0].metric("Слов", info["всего"])
+    cols[1].metric("Произведений", info["произведений"])
+    cols[2].metric("За неделю", info["за неделю"])
+    cols[3].metric("За месяц", info["за месяц"])
+
+    st.subheader("Книжная полка")
+    order = st.radio("Порядок", ["Больше слов выше", "По алфавиту"], horizontal=True, key="shelf_order")
+    for title, items in utils.shelf(words, "count" if order == "Больше слов выше" else "az"):
+        head = f"{title} · {len(items)}"
+        if progress is not None:
+            head += f" · выучено {sum(1 for w in items if train.is_learned(progress, w))}/{len(items)}"
+        with st.expander(head):
+            url = reviews.get(title)
+            if url:
+                st.markdown(f"[📝 Рецензия в канале «Второе чтение»]({url})")
+            for w in items:
+                line = f"**{capitalize_first(w['слово'])}**"
+                if w["пометка"]:
+                    line += f" · :gray[{w['пометка']}]"
+                st.markdown(f"{line} — {w['значение']}")
+                if w["теги"]:
+                    st.caption("🏷 " + ", ".join(split_tags(w["теги"])))
+
+    st.subheader("Статистика")
+    import pandas as pd
+
+    weekly = utils.words_per_week(words)
+    st.markdown("**Сколько слов добавлено по неделям** (последние 12, неделя с понедельника)")
+    st.bar_chart(pd.Series({d.strftime("%d.%m"): n for d, n in weekly}, name="слов"))
+
+    def bars(title: str, counts: dict):
+        if not counts:
+            return
+        st.markdown(f"**{title}**")
+        top = max(counts.values())
+        for name, n in list(counts.items())[:15]:
+            st.progress(n / top, text=f"{name} · {n}")
+
+    bars("По произведениям", utils.count_by(words, "произведение"))
+    bars("По пометкам", utils.count_by(words, "пометка"))
+    bars("По тегам", utils.count_tags(words))
+    st.caption(f"С картинкой: {info['с картинкой']} из {info['всего']} · с цитатой: {info['с цитатой']} из {info['всего']}"
+               + (f" · без даты добавления: {info['без даты']}" if info["без даты"] else ""))
+
+
+# ---------- карточка для поста ----------
+def post_tab(words: list[dict], reviews: dict):
+    if not words:
+        st.info("Пока пусто: добавь первые слова.")
+        return
+    names = [w["слово"] for w in sort_words(words, "az")]
+    chosen = st.selectbox("Слово для поста", names, format_func=capitalize_first, key="post_pick")
+    w = next(x for x in words if x["слово"] == chosen)
+    try:
+        png = card.render_card(w, image_bytes_from_repo(w["картинка"]))
+    except FileNotFoundError as exc:
+        st.error(str(exc))
+        return
+    st.image(png, use_container_width=True)
+    st.download_button("⬇️ Скачать картинку (PNG)", png, file_name=f"{store.slugify(w['слово'])}.png", mime="image/png")
+    text = card.post_text(w, reviews.get(w["произведение"], ""))
+    st.markdown("**Текст поста** (справа вверху у блока есть кнопка «копировать»):")
+    st.code(text, language=None)
+    if len(text) > 1024:
+        st.caption(f"В тексте {len(text)} знаков, а подпись под фото в Telegram ограничена 1024. Отправь картинку отдельно, а текст следом.")
+    else:
+        st.caption(f"{len(text)} знаков: влезает в подпись под фото (лимит Telegram 1024).")
+
+
+# ---------- экспорт ----------
+@st.cache_data
+def build_html(words_version: float, reviews_version: float) -> str:
+    ws, _ = get_words(words_version)
+    return export.to_html(ws, image_loader=image_bytes_from_repo, reviews=get_reviews(reviews_version))
+
+
+def export_tab(words: list[dict]):
+    if not words:
+        st.info("Пока пусто: добавь первые слова.")
+        return
+    st.download_button("📊 Таблица (CSV) для Excel и Google Таблиц", export.to_csv(words), file_name="slovar.csv", mime="text/csv")
+    st.caption("Разделитель «;», кодировка UTF-8: в русском Excel открывается без «кракозябр».")
+    version = WORDS_FILE.stat().st_mtime if WORDS_FILE.exists() else 0.0
+    rev_version = REVIEWS_FILE.stat().st_mtime if REVIEWS_FILE.exists() else 0.0
+    st.download_button("🖨 Страница для печати / PDF (HTML)", build_html(version, rev_version).encode("utf-8"),
+                       file_name="slovar.html", mime="text/html")
+    st.caption("Открой файл в браузере → Печать → «Сохранить как PDF». Картинки уже внутри файла.")
+    if WORDS_FILE.exists():
+        st.download_button("📄 Исходный файл words.yaml", WORDS_FILE.read_bytes(), file_name="words.yaml", mime="text/yaml")
+        st.caption("Резервная копия всех слов в исходном виде.")
+
+
 # ---------- данные ----------
 words, problems = get_words(WORDS_FILE.stat().st_mtime if WORDS_FILE.exists() else 0.0)
+reviews = get_reviews(REVIEWS_FILE.stat().st_mtime if REVIEWS_FILE.exists() else 0.0)
+
+appearance()
 
 st.title("📖 Словарь прочитанного")
 st.caption(f"Слов в словаре: {len(words)}")
 for problem in problems:
     st.warning(problem)
 
-tab_dict, tab_add, tab_edit, tab_train = st.tabs(["📖 Словарь", "➕ Добавить слово", "✏️ Править / удалить", "🎯 Тренировка"])
+tab_dict, tab_shelf, tab_train, tab_post, tab_add, tab_edit, tab_export = st.tabs(
+    ["📖 Словарь", "📚 Полка", "🎯 Тренировка", "🖼 Для поста", "➕ Добавить слово", "✏️ Править / удалить", "📤 Экспорт"]
+)
 
 with tab_add:
     add_tab(words)
@@ -519,6 +698,15 @@ with tab_train:
 # прогресс известен только после входа; без него словарь просто не показывает отметки «выучено»
 progress = st.session_state.get("progress") if st.session_state.get("add_ok") else None
 
+with tab_shelf:
+    shelf_tab(words, progress, reviews)
+
+with tab_post:
+    post_tab(words, reviews)
+
+with tab_export:
+    export_tab(words)
+
 with tab_dict:
     if not words:
         st.info("Словарь пока пуст. Добавь первое слово на вкладке «Добавить слово».")
@@ -529,15 +717,17 @@ with tab_dict:
             query = st.text_input("Слово, значение или цитата")
             work = st.selectbox("Произведение", ["Все"] + unique_values(words, "произведение"))
             label = st.selectbox("Пометка", ["Все"] + unique_values(words, "пометка"))
+            all_tags = unique_tags(words)
+            chosen_tags = st.multiselect("Теги", all_tags) if all_tags else []
             order = st.radio("Порядок", ["По алфавиту", "Сначала новые"])
             hide_learned = st.checkbox("Скрыть выученные") if progress is not None else False
 
         # ---------- слово дня ----------
-        if not query and work == "Все" and label == "Все":
+        if not query and work == "Все" and label == "Все" and not chosen_tags:
             today_word = word_of_day(words)
             if today_word:
                 st.subheader("Слово дня")
-                show_word(today_word)
+                show_word(today_word, review_url=reviews.get(today_word["произведение"], ""))
                 st.divider()
 
         # ---------- список ----------
@@ -546,6 +736,7 @@ with tab_dict:
             query=query,
             work="" if work == "Все" else work,
             label="" if label == "Все" else label,
+            tags=chosen_tags,
         )
         found = sort_words(found, "new" if order == "Сначала новые" else "az")
         if hide_learned:
@@ -555,4 +746,5 @@ with tab_dict:
         if not found:
             st.info("Ничего не нашлось. Попробуй изменить запрос или сбросить фильтры.")
         for item in found:
-            show_word(item, learned=progress is not None and train.is_learned(progress, item))
+            show_word(item, learned=progress is not None and train.is_learned(progress, item),
+                      review_url=reviews.get(item["произведение"], ""))
