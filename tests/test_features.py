@@ -16,7 +16,7 @@ import utils  # noqa: E402
 from test_store import FakeRepo, _raises  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-WORDS, _ = utils.load_words(ROOT / "words.yaml")
+WORDS, _ = utils.load_words(ROOT / "tests" / "fixtures" / "words_seed.yaml")  # фиксированный образец: настоящий словарь растёт
 BY = {w["слово"]: w for w in WORDS}
 
 

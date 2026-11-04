@@ -67,7 +67,7 @@ def test_date_field_becomes_text():
 
 
 def test_search_filters():
-    words, _ = load_words(ROOT / "words.yaml")
+    words, _ = load_words(ROOT / "tests" / "fixtures" / "words_seed.yaml")
     assert [w["слово"] for w in filter_words(words, query="ЖЕРЕБИЙ")] == ["жеребий"]
     assert len(filter_words(words, query="полиции")) == 1  # по значению
     assert len(filter_words(words, query="шмит")) == 1  # по цитате
@@ -78,7 +78,7 @@ def test_search_filters():
 
 
 def test_sorting():
-    words, _ = load_words(ROOT / "words.yaml")
+    words, _ = load_words(ROOT / "tests" / "fixtures" / "words_seed.yaml")
     az = [w["слово"] for w in sort_words(words, "az")]
     assert az == sorted(az, key=norm)
     newer = {"слово": "новое", "значение": "х", "добавлено": "2027-01-01"}
@@ -89,7 +89,7 @@ def test_sorting():
 
 
 def test_unique_values_and_word_of_day():
-    words, _ = load_words(ROOT / "words.yaml")
+    words, _ = load_words(ROOT / "tests" / "fixtures" / "words_seed.yaml")
     assert "«Выстрел», А. С. Пушкин" in unique_values(words, "произведение")
     day = date(2026, 10, 23)
     assert word_of_day(words, day) == word_of_day(words, day)

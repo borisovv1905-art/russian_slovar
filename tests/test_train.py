@@ -13,7 +13,7 @@ from test_store import FakeRepo, Resp, FakeHttp, _raises  # noqa: E402
 from utils import load_words  # noqa: E402
 
 ROOT = Path(__file__).resolve().parent.parent
-WORDS, _ = load_words(ROOT / "words.yaml")
+WORDS, _ = load_words(ROOT / "tests" / "fixtures" / "words_seed.yaml")  # фиксированный образец: настоящий словарь растёт
 D1, D2 = date(2026, 10, 26), date(2026, 10, 30)
 
 
